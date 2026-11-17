@@ -1,0 +1,15 @@
+jose-util/jose-util
+jose-util.t.err
+
+# Local credentials and secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*credentials*
+*.token
+*.secret
