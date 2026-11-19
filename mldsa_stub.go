@@ -36,6 +36,8 @@ func mldsaSigner(_ SignatureAlgorithm, _ interface{}) (recipientSigInfo, bool, e
 
 func mldsaVerifier(_ interface{}) (payloadVerifier, bool, error) { return nil, false, nil }
 
+func mldsaKeyMatchesAlgorithm(_ interface{}, _ SignatureAlgorithm) bool { return false }
+
 func mldsaRawJWK(_ interface{}) (*rawJSONWebKey, bool, error) { return nil, false, nil }
 
 func mldsaParseJWK(_ *rawJSONWebKey, _ interface{}) (interface{}, error) {

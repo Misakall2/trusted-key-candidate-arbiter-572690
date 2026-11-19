@@ -133,6 +133,155 @@ type payloadVerifier interface {
 
 var errInvalidVerificationKey = errors.New("go-jose/go-jose: invalid verification key")
 
+// JWKSVerificationErrorKind classifies the reason a verification key could not
+// be selected from a [JSONWebKeySet]. It lets a caller decide how to repair its
+// key set without inspecting error text.
+type JWKSVerificationErrorKind int
+
+const (
+	// JWKSVerificationErrorMissingKid means the signature header carried no
+	// "kid" parameter, so no candidate could be identified.
+	JWKSVerificationErrorMissingKid JWKSVerificationErrorKind = iota
+	// JWKSVerificationErrorNoMatchingKey means no key in the set was eligible
+	// for the "kid", key use, algorithm and key type required by the signature.
+	JWKSVerificationErrorNoMatchingKey
+	// JWKSVerificationErrorAmbiguousKey means more than one key in the set was
+	// eligible. The ambiguous key must be resolved before verification can run.
+	JWKSVerificationErrorAmbiguousKey
+)
+
+// JWKSVerificationError is returned when selecting a verification key from a
+// [JSONWebKeySet] fails. It carries only the failure kind and the public "kid"
+// from the signature header; it never contains token contents.
+type JWKSVerificationError struct {
+	// Kind is the reason key selection failed.
+	Kind JWKSVerificationErrorKind
+	// KeyID is the "kid" carried by the signature header. It is empty when the
+	// header did not specify one.
+	KeyID string
+}
+
+func (e *JWKSVerificationError) Error() string {
+	switch e.Kind {
+	case JWKSVerificationErrorMissingKid:
+		return "go-jose/go-jose: JWS is missing the kid header parameter required to select a key from the JWK Set"
+	case JWKSVerificationErrorAmbiguousKey:
+		return fmt.Sprintf("go-jose/go-jose: JWK Set contains multiple eligible keys for kid %q", e.KeyID)
+	default:
+		return fmt.Sprintf("go-jose/go-jose: no eligible verification key found in JWK Set for kid %q", e.KeyID)
+	}
+}
+
+// Is keeps the long-standing [ErrJWKSKidNotFound] contract: failures to resolve
+// a key (a missing or unmatched "kid") continue to match it, while an ambiguous
+// selection is a distinct outcome.
+func (e *JWKSVerificationError) Is(target error) bool {
+	if target == ErrJWKSKidNotFound {
+		return e.Kind == JWKSVerificationErrorMissingKid ||
+			e.Kind == JWKSVerificationErrorNoMatchingKey
+	}
+	return false
+}
+
+// jwksKeyTypeMatches reports whether a JWK's key type can produce a verifier
+// for the given signature algorithm. Only asymmetric public key types are
+// eligible for JWS verification against a JWK Set.
+func jwksKeyTypeMatches(key *JSONWebKey, alg SignatureAlgorithm) bool {
+	switch key.Key.(type) {
+	case ed25519.PublicKey:
+		return alg == EdDSA
+	case *rsa.PublicKey:
+		switch alg {
+		case RS256, RS384, RS512, PS256, PS384, PS512:
+			return true
+		}
+	case *ecdsa.PublicKey:
+		switch alg {
+		case ES256, ES384, ES512:
+			return true
+		}
+	default:
+		// ML-DSA (and any future verifier) reports eligibility itself, but the
+		// key's parameter set must still match the algorithm of the signature.
+		if mldsaKeyMatchesAlgorithm(key.Key, alg) {
+			return true
+		}
+	}
+	return false
+}
+
+// jwksKeyIsEligibleForVerify reports whether a single JWK may verify a
+// signature that carries the given algorithm. The checks deliberately reject
+// signing-only material and anything outside the caller's algorithm and key
+// type scope.
+func jwksKeyIsEligibleForVerify(key *JSONWebKey, alg SignatureAlgorithm) bool {
+	// An explicit "use" other than "sig" marks the key for another purpose
+	// (e.g. "enc"). A missing "use" places no restriction.
+	if key.Use != "" && key.Use != "sig" {
+		return false
+	}
+	// Only public keys may verify; private and symmetric material is
+	// signing-only for this path and must not take part in verification.
+	if !key.IsPublic() {
+		return false
+	}
+	// A key that advertises an "alg" must advertise one in the algorithm scope
+	// the verifier explicitly allowed at parse time. A missing "alg" places no
+	// restriction; the token header is never allowed to widen the scope.
+	if key.Algorithm != "" && key.Algorithm != string(alg) {
+		return false
+	}
+	return jwksKeyTypeMatches(key, alg)
+}
+
+// selectVerificationKeyFromJWKS implements the JWK Set selection rules for JWS
+// verification. Only the key set supplied by the caller is considered: the
+// token is never dereferenced for remote keys.
+//
+// Candidates are first narrowed by "kid" and verifiable key use, then by the
+// signature algorithm and public key type. A single surviving key is returned.
+// Zero eligible keys and more than one eligible key produce distinguishable
+// errors. The result does not depend on the order keys appear in the set.
+func selectVerificationKeyFromJWKS(jwks JSONWebKeySet, header Header, alg SignatureAlgorithm) (interface{}, error) {
+	kid := header.KeyID
+	if kid == "" {
+		return nil, &JWKSVerificationError{Kind: JWKSVerificationErrorMissingKid}
+	}
+
+	var candidates []JSONWebKey
+	for _, key := range jwks.Keys {
+		if key.KeyID != kid {
+			continue
+		}
+		if jwksKeyIsEligibleForVerify(&key, alg) {
+			candidates = append(candidates, key)
+		}
+	}
+
+	switch len(candidates) {
+	case 0:
+		return nil, &JWKSVerificationError{Kind: JWKSVerificationErrorNoMatchingKey, KeyID: kid}
+	case 1:
+		return candidates[0].Key, nil
+	default:
+		return nil, &JWKSVerificationError{Kind: JWKSVerificationErrorAmbiguousKey, KeyID: kid}
+	}
+}
+
+// verificationKeyFromSet resolves a JWK Set argument to a single verification
+// key using the JWS selection rules. Non-JWK Set arguments are returned
+// unchanged so that callers passing a single key keep their existing behavior.
+func verificationKeyFromSet(verificationKey interface{}, header Header, alg SignatureAlgorithm) (interface{}, error) {
+	switch jwks := verificationKey.(type) {
+	case *JSONWebKeySet:
+		return selectVerificationKeyFromJWKS(*jwks, header, alg)
+	case JSONWebKeySet:
+		return selectVerificationKeyFromJWKS(jwks, header, alg)
+	default:
+		return verificationKey, nil
+	}
+}
+
 type genericSigner struct {
 	recipients   []recipientSigInfo
 	nonceSource  NonceSource
@@ -437,7 +586,9 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 
 	signature := obj.Signatures[0]
 
-	key, err := tryJWKS(verificationKey, signature.Header)
+	headers := signature.mergedHeaders()
+	alg := headers.getSignatureAlgorithm()
+	key, err := verificationKeyFromSet(verificationKey, signature.Header, alg)
 	if err != nil {
 		return err
 	}
@@ -470,8 +621,6 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 		return ErrCryptoFailure
 	}
 
-	headers := signature.mergedHeaders()
-	alg := headers.getSignatureAlgorithm()
 	err = verifier.verifyPayload(input, signature.Signature, alg)
 	if err != nil {
 		return ErrCryptoFailure
@@ -529,10 +678,18 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 			}
 		}
 
-		// If the verification key is a JWK Set, pick a key based on this signature's
-		// "kid" header. If no match, skip this signature.
-		key, err := tryJWKS(verificationKey, signature.Header)
+		// If the verification key is a JWK Set, pick a key based on this
+		// signature's "kid" and the caller's allowed algorithm/key types. A
+		// missing or unmatched "kid" means this signature cannot be verified and
+		// is skipped; multiple eligible keys are an unrecoverable ambiguity.
+		headers := signature.mergedHeaders()
+		alg := headers.getSignatureAlgorithm()
+		key, err := verificationKeyFromSet(verificationKey, signature.Header, alg)
 		if err != nil {
+			var keyErr *JWKSVerificationError
+			if errors.As(err, &keyErr) && keyErr.Kind == JWKSVerificationErrorAmbiguousKey {
+				return -1, Signature{}, err
+			}
 			continue
 		}
 		verifier, err := newVerifier(key)
@@ -545,8 +702,6 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 			continue
 		}
 
-		headers := signature.mergedHeaders()
-		alg := headers.getSignatureAlgorithm()
 		err = verifier.verifyPayload(input, signature.Signature, alg)
 		if err != nil {
 			continue

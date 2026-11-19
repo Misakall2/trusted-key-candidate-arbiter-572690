@@ -150,6 +150,20 @@ func mldsaVerifier(key interface{}) (payloadVerifier, bool, error) {
 	}, true, nil
 }
 
+// mldsaKeyMatchesAlgorithm reports whether key is a valid ML-DSA public key
+// whose parameter set corresponds to the requested signature algorithm.
+func mldsaKeyMatchesAlgorithm(key interface{}, alg SignatureAlgorithm) bool {
+	publicKey, ok := key.(*mldsa.PublicKey)
+	if !ok || publicKey == nil || *publicKey == (mldsa.PublicKey{}) {
+		return false
+	}
+	keyAlg, ok := mldsaAlgFor(publicKey.Parameters())
+	if !ok {
+		return false
+	}
+	return keyAlg == alg
+}
+
 // mldsaRawJWK converts an ML-DSA key to its AKP JWK representation. The "alg"
 // member is derived from the key's own parameter set, because RFC 9964 requires
 // it on every AKP key and it is the only member identifying the parameter set.
